@@ -4,24 +4,82 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
-// Per-language config. Block 4 will add more entries to this object —
-// the runner function below is already written to be language-agnostic.
+// Per-language config.
+//
+// Two shapes:
+//  - interpreted languages: { image, filename, buildCommand }
+//      buildCommand(containerFilePath) -> argv array that runs the source directly
+//  - compiled languages: { image, filename, compiled: true, compileCommand, runCommand }
+//      compileCommand(containerFilePath, containerDir) -> argv array that builds the binary
+//      runCommand(containerDir) -> argv array that executes the built artifact
 const LANGUAGE_CONFIG = {
   python: {
     image: 'coderunner-python',
     filename: 'main.py',
-    // Command run *inside* the container, with {file} substituted
-    // for the path the code will be mounted at.
     buildCommand: (file) => ['python3', file],
+  },
+  javascript: {
+    image: 'coderunner-javascript',
+    filename: 'main.js',
+    buildCommand: (file) => ['node', file],
+  },
+  c: {
+    image: 'coderunner-c',
+    filename: 'main.c',
+    compiled: true,
+    compileCommand: (file, dir) => ['gcc', file, '-O2', '-o', `${dir}/a.out`],
+    runCommand: (dir) => [`${dir}/a.out`],
+  },
+  cpp: {
+    image: 'coderunner-cpp',
+    filename: 'main.cpp',
+    compiled: true,
+    compileCommand: (file, dir) => ['g++', file, '-O2', '-o', `${dir}/a.out`],
+    runCommand: (dir) => [`${dir}/a.out`],
+  },
+  java: {
+    image: 'coderunner-java',
+    // MVP constraint: user code must declare `public class Main`.
+    filename: 'Main.java',
+    compiled: true,
+    compileCommand: (file, dir) => ['javac', file, '-d', dir],
+    runCommand: (dir) => ['java', '-cp', dir, 'Main'],
   },
 };
 
-const TIMEOUT_MS = 10_000; // 10 second hard cap for this block; tuned in Block 3
-const MAX_OUTPUT_CHARS = 200_000; // crude guard against runaway output for now
+const RUN_TIMEOUT_MS = 10_000;     // hard cap on the EXECUTION phase
+const COMPILE_TIMEOUT_MS = 15_000; // separate, slightly more generous cap on the COMPILE phase
+const MAX_OUTPUT_CHARS = 200_000;
+
+// Resource limits applied to every container, both compile and run phases.
+// Compile gets a higher pids-limit because real compilers (gcc/g++ especially)
+// spawn several helper subprocesses (cc1, as, ld, ...) under the hood.
+const RUN_LIMITS = {
+  memory: '128m',
+  memorySwap: '128m',
+  cpus: '0.5',
+  pidsLimit: '64',
+};
+
+const COMPILE_LIMITS = {
+  memory: '256m',
+  memorySwap: '256m',
+  cpus: '1.0',
+  pidsLimit: '128',
+};
+
+const OOM_EXIT_CODE = 137;
 
 /**
- * Runs user-submitted code for a given language inside a one-shot Docker container.
- * Returns { stdout, stderr, exitCode, executionTime, timedOut }.
+ * Runs user-submitted code for a given language. For interpreted languages this
+ * is a single container invocation. For compiled languages this is two:
+ * a compile container (writable mount, relaxed-but-still-limited resources)
+ * followed by a run container (read-only mount, Block 3 hardening intact).
+ *
+ * Returns:
+ *  { phase: 'compile', stdout, stderr, exitCode, executionTime, timedOut, oomKilled }
+ *  or
+ *  { phase: 'run', stdout, stderr, exitCode, executionTime, timedOut, oomKilled, compileTime? }
  */
 async function runInDocker(language, code) {
   const config = LANGUAGE_CONFIG[language];
@@ -29,48 +87,138 @@ async function runInDocker(language, code) {
     throw new Error(`No Docker runner configured for language: ${language}`);
   }
 
-  // 1. Create an isolated temp directory on the host for this single request.
-  //    Using os.tmpdir() + a random suffix avoids collisions between
-  //    concurrent requests (important once multiple users hit /api/run at once).
   const requestId = crypto.randomUUID();
   const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), 'coderunner-'));
   const hostFilePath = path.join(hostDir, config.filename);
-  const containerName = `coderunner-${requestId}`;
-
   await fs.writeFile(hostFilePath, code, 'utf8');
 
-  const containerFilePath = `/code/${config.filename}`;
-  const innerCommand = config.buildCommand(containerFilePath);
-//   innerCommand = ['python3', '/workspace/main.py']
-
-  const dockerArgs = [
-    'run',
-    '--rm', // auto-remove the container's writable layer on exit
-    '--name', containerName,
-    '-v', `${hostFilePath}:${containerFilePath}:ro`, // bind mount, read-only
-    config.image,
-    ...innerCommand,
-  ];
-
-  const startTime = Date.now();
+  const containerDir = '/code';
+  const containerFilePath = `${containerDir}/${config.filename}`;
 
   try {
-    const result = await spawnWithTimeout('docker', dockerArgs, containerName, TIMEOUT_MS);
-    return {
-      ...result,
-      executionTime: Date.now() - startTime,
-    };
+    if (config.compiled) {
+      return await runCompiled(config, hostDir, containerFilePath, containerDir, requestId);
+    }
+    return await runInterpreted(config, hostDir, containerFilePath, requestId);
   } finally {
-    // Always clean up the temp dir, whether the run succeeded, failed, or timed out.
     await fs.rm(hostDir, { recursive: true, force: true });
   }
 }
 
+async function runInterpreted(config, hostDir, containerFilePath, requestId) {
+  const containerName = `coderunner-${requestId}-run`;
+  const args = buildDockerArgs({
+    containerName,
+    image: config.image,
+    hostDir,
+    containerDir: '/code',
+    command: config.buildCommand(containerFilePath),
+    limits: RUN_LIMITS,
+    readOnlyMount: true,
+    readOnlyRoot: true,
+  });
+
+  const startTime = Date.now();
+  const result = await spawnWithTimeout('docker', args, containerName, RUN_TIMEOUT_MS);
+  return {
+    phase: 'run',
+    ...result,
+    executionTime: Date.now() - startTime,
+  };
+}
+
+async function runCompiled(config, hostDir, containerFilePath, containerDir, requestId) {
+  // --- Compile phase ---
+  const compileContainerName = `coderunner-${requestId}-compile`;
+  const compileArgs = buildDockerArgs({
+    containerName: compileContainerName,
+    image: config.image,
+    hostDir,
+    containerDir,
+    command: config.compileCommand(containerFilePath, containerDir),
+    limits: COMPILE_LIMITS,
+    readOnlyMount: false, // compiler needs to write the binary/.class files here
+    readOnlyRoot: false,  // some compilers want scratch space outside /tmp too
+  });
+
+  const compileStart = Date.now();
+  const compileResult = await spawnWithTimeout(
+    'docker', compileArgs, compileContainerName, COMPILE_TIMEOUT_MS
+  );
+  const compileTime = Date.now() - compileStart;
+
+  // If compilation failed (nonzero exit, OOM, or timeout) we stop here —
+  // there's nothing to run, and the caller needs to know this was a
+  // compile-time problem, not a runtime one.
+  if (compileResult.timedOut || compileResult.exitCode !== 0) {
+    return {
+      phase: 'compile',
+      ...compileResult,
+      executionTime: compileTime,
+    };
+  }
+
+  // --- Run phase ---
+  const runContainerName = `coderunner-${requestId}-run`;
+  const runArgs = buildDockerArgs({
+    containerName: runContainerName,
+    image: config.image,
+    hostDir,
+    containerDir,
+    command: config.runCommand(containerDir),
+    limits: RUN_LIMITS,
+    readOnlyMount: true,
+    readOnlyRoot: true,
+  });
+
+  const runStart = Date.now();
+  const runResult = await spawnWithTimeout('docker', runArgs, runContainerName, RUN_TIMEOUT_MS);
+  return {
+    phase: 'run',
+    ...runResult,
+    executionTime: Date.now() - runStart,
+    compileTime,
+  };
+}
+
 /**
- * Wraps spawn() in a Promise, collects stdout/stderr, and enforces a timeout
- * by issuing `docker kill` against the container name (not just killing the
- * local `docker run` CLI process, which would leave the container running).
+ * Builds the full `docker run` argv for one container invocation, applying
+ * the Block 3 hardening flags (network/fs/privilege) plus whichever resource
+ * limits are passed in.
  */
+function buildDockerArgs({
+  containerName, image, hostDir, containerDir, command, limits, readOnlyMount, readOnlyRoot,
+}) {
+  const args = [
+    'run',
+    '--rm',
+    '--name', containerName,
+
+    // --- Resource limits ---
+    '--memory', limits.memory,
+    '--memory-swap', limits.memorySwap,
+    '--cpus', limits.cpus,
+    '--pids-limit', limits.pidsLimit,
+
+    // --- Network isolation ---
+    '--network', 'none',
+
+    // --- Privilege hardening (always on, compile and run alike) ---
+    '--security-opt', 'no-new-privileges',
+    '--cap-drop', 'ALL',
+  ];
+
+  if (readOnlyRoot) {
+    args.push('--read-only', '--tmpfs', '/tmp:rw,size=16m,noexec');
+  }
+
+  const mountFlag = readOnlyMount ? 'ro' : 'rw';
+  args.push('-v', `${hostDir}:${containerDir}:${mountFlag}`);
+
+  args.push(image, ...command);
+  return args;
+}
+
 function spawnWithTimeout(command, args, containerName, timeoutMs) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args);
@@ -81,13 +229,7 @@ function spawnWithTimeout(command, args, containerName, timeoutMs) {
 
     const timer = setTimeout(() => {
       timedOut = true;
-      // Fire-and-forget: ask the Docker daemon to kill the container by name.
-      // We don't await this — the main child process will exit shortly after
-      // its container is killed, which resolves this promise via the 'close' handler.
-      spawn('docker', ['kill', containerName]).on('error', () => {
-        // If `docker kill` itself fails (e.g. container already exited
-        // between us deciding to time out and issuing the kill), that's fine.
-      });
+      spawn('docker', ['kill', containerName]).on('error', () => {});
     }, timeoutMs);
 
     child.stdout.on('data', (chunk) => {
@@ -105,16 +247,22 @@ function spawnWithTimeout(command, args, containerName, timeoutMs) {
 
     child.on('close', (exitCode) => {
       clearTimeout(timer);
+
+      const oomKilled = !timedOut && exitCode === OOM_EXIT_CODE;
+
       resolve({
         stdout: stdout.slice(0, MAX_OUTPUT_CHARS),
         stderr: timedOut
           ? stderr + '\n[Execution timed out and was terminated]'
-          : stderr.slice(0, MAX_OUTPUT_CHARS),
+          : oomKilled
+            ? stderr + '\n[Process killed: memory limit exceeded]'
+            : stderr.slice(0, MAX_OUTPUT_CHARS),
         exitCode: timedOut ? null : exitCode,
         timedOut,
+        oomKilled,
       });
     });
   });
 }
 
-module.exports = { runInDocker, LANGUAGE_CONFIG };
+module.exports = { runInDocker, LANGUAGE_CONFIG, RUN_LIMITS, COMPILE_LIMITS };

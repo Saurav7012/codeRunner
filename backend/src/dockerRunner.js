@@ -4,14 +4,6 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
-// Per-language config.
-//
-// Two shapes:
-//  - interpreted languages: { image, filename, buildCommand }
-//      buildCommand(containerFilePath) -> argv array that runs the source directly
-//  - compiled languages: { image, filename, compiled: true, compileCommand, runCommand }
-//      compileCommand(containerFilePath, containerDir) -> argv array that builds the binary
-//      runCommand(containerDir) -> argv array that executes the built artifact
 const LANGUAGE_CONFIG = {
   python: {
     image: 'coderunner-python',
@@ -39,7 +31,6 @@ const LANGUAGE_CONFIG = {
   },
   java: {
     image: 'coderunner-java',
-    // MVP constraint: user code must declare `public class Main`.
     filename: 'Main.java',
     compiled: true,
     compileCommand: (file, dir) => ['javac', file, '-d', dir],
@@ -47,13 +38,10 @@ const LANGUAGE_CONFIG = {
   },
 };
 
-const RUN_TIMEOUT_MS = 10_000;     // hard cap on the EXECUTION phase
-const COMPILE_TIMEOUT_MS = 15_000; // separate, slightly more generous cap on the COMPILE phase
+const RUN_TIMEOUT_MS = 10_000;
+const COMPILE_TIMEOUT_MS = 15_000;
 const MAX_OUTPUT_CHARS = 200_000;
 
-// Resource limits applied to every container, both compile and run phases.
-// Compile gets a higher pids-limit because real compilers (gcc/g++ especially)
-// spawn several helper subprocesses (cc1, as, ld, ...) under the hood.
 const RUN_LIMITS = {
   memory: '128m',
   memorySwap: '128m',
@@ -71,17 +59,15 @@ const COMPILE_LIMITS = {
 const OOM_EXIT_CODE = 137;
 
 /**
- * Runs user-submitted code for a given language. For interpreted languages this
- * is a single container invocation. For compiled languages this is two:
- * a compile container (writable mount, relaxed-but-still-limited resources)
- * followed by a run container (read-only mount, Block 3 hardening intact).
+ * Runs user-submitted code for a given language inside Docker.
+ * `stdin` is an optional string fed to the program's standard input.
  *
  * Returns:
  *  { phase: 'compile', stdout, stderr, exitCode, executionTime, timedOut, oomKilled }
  *  or
  *  { phase: 'run', stdout, stderr, exitCode, executionTime, timedOut, oomKilled, compileTime? }
  */
-async function runInDocker(language, code) {
+async function runInDocker(language, code, stdin = '') {
   const config = LANGUAGE_CONFIG[language];
   if (!config) {
     throw new Error(`No Docker runner configured for language: ${language}`);
@@ -97,15 +83,15 @@ async function runInDocker(language, code) {
 
   try {
     if (config.compiled) {
-      return await runCompiled(config, hostDir, containerFilePath, containerDir, requestId);
+      return await runCompiled(config, hostDir, containerFilePath, containerDir, requestId, stdin);
     }
-    return await runInterpreted(config, hostDir, containerFilePath, requestId);
+    return await runInterpreted(config, hostDir, containerFilePath, requestId, stdin);
   } finally {
     await fs.rm(hostDir, { recursive: true, force: true });
   }
 }
 
-async function runInterpreted(config, hostDir, containerFilePath, requestId) {
+async function runInterpreted(config, hostDir, containerFilePath, requestId, stdin) {
   const containerName = `coderunner-${requestId}-run`;
   const args = buildDockerArgs({
     containerName,
@@ -116,10 +102,11 @@ async function runInterpreted(config, hostDir, containerFilePath, requestId) {
     limits: RUN_LIMITS,
     readOnlyMount: true,
     readOnlyRoot: true,
+    withStdin: true, // always open stdin pipe on run containers
   });
 
   const startTime = Date.now();
-  const result = await spawnWithTimeout('docker', args, containerName, RUN_TIMEOUT_MS);
+  const result = await spawnWithTimeout('docker', args, containerName, RUN_TIMEOUT_MS, stdin);
   return {
     phase: 'run',
     ...result,
@@ -127,8 +114,8 @@ async function runInterpreted(config, hostDir, containerFilePath, requestId) {
   };
 }
 
-async function runCompiled(config, hostDir, containerFilePath, containerDir, requestId) {
-  // --- Compile phase ---
+async function runCompiled(config, hostDir, containerFilePath, containerDir, requestId, stdin) {
+  // --- Compile phase (no stdin) ---
   const compileContainerName = `coderunner-${requestId}-compile`;
   const compileArgs = buildDockerArgs({
     containerName: compileContainerName,
@@ -137,19 +124,17 @@ async function runCompiled(config, hostDir, containerFilePath, containerDir, req
     containerDir,
     command: config.compileCommand(containerFilePath, containerDir),
     limits: COMPILE_LIMITS,
-    readOnlyMount: false, // compiler needs to write the binary/.class files here
-    readOnlyRoot: false,  // some compilers want scratch space outside /tmp too
+    readOnlyMount: false,
+    readOnlyRoot: false,
+    withStdin: false, // compilers don't read stdin
   });
 
   const compileStart = Date.now();
   const compileResult = await spawnWithTimeout(
-    'docker', compileArgs, compileContainerName, COMPILE_TIMEOUT_MS
+    'docker', compileArgs, compileContainerName, COMPILE_TIMEOUT_MS, ''
   );
   const compileTime = Date.now() - compileStart;
 
-  // If compilation failed (nonzero exit, OOM, or timeout) we stop here —
-  // there's nothing to run, and the caller needs to know this was a
-  // compile-time problem, not a runtime one.
   if (compileResult.timedOut || compileResult.exitCode !== 0) {
     return {
       phase: 'compile',
@@ -158,7 +143,7 @@ async function runCompiled(config, hostDir, containerFilePath, containerDir, req
     };
   }
 
-  // --- Run phase ---
+  // --- Run phase (with stdin) ---
   const runContainerName = `coderunner-${requestId}-run`;
   const runArgs = buildDockerArgs({
     containerName: runContainerName,
@@ -169,10 +154,11 @@ async function runCompiled(config, hostDir, containerFilePath, containerDir, req
     limits: RUN_LIMITS,
     readOnlyMount: true,
     readOnlyRoot: true,
+    withStdin: true,
   });
 
   const runStart = Date.now();
-  const runResult = await spawnWithTimeout('docker', runArgs, runContainerName, RUN_TIMEOUT_MS);
+  const runResult = await spawnWithTimeout('docker', runArgs, runContainerName, RUN_TIMEOUT_MS, stdin);
   return {
     phase: 'run',
     ...runResult,
@@ -182,31 +168,34 @@ async function runCompiled(config, hostDir, containerFilePath, containerDir, req
 }
 
 /**
- * Builds the full `docker run` argv for one container invocation, applying
- * the Block 3 hardening flags (network/fs/privilege) plus whichever resource
- * limits are passed in.
+ * Builds the full `docker run` argv for one container invocation.
+ * `withStdin: true` adds `-i` so the container's stdin stays open until
+ * we close the host-side pipe in spawnWithTimeout.
  */
 function buildDockerArgs({
-  containerName, image, hostDir, containerDir, command, limits, readOnlyMount, readOnlyRoot,
+  containerName, image, hostDir, containerDir, command, limits, readOnlyMount, readOnlyRoot, withStdin,
 }) {
   const args = [
     'run',
     '--rm',
     '--name', containerName,
 
-    // --- Resource limits ---
     '--memory', limits.memory,
     '--memory-swap', limits.memorySwap,
     '--cpus', limits.cpus,
     '--pids-limit', limits.pidsLimit,
 
-    // --- Network isolation ---
     '--network', 'none',
 
-    // --- Privilege hardening (always on, compile and run alike) ---
     '--security-opt', 'no-new-privileges',
     '--cap-drop', 'ALL',
   ];
+
+  if (withStdin) {
+    // Keep the container's stdin pipe open so we can write to it.
+    // Without -i, Docker closes the container's stdin immediately on startup.
+    args.push('-i');
+  }
 
   if (readOnlyRoot) {
     args.push('--read-only', '--tmpfs', '/tmp:rw,size=16m,noexec');
@@ -219,7 +208,12 @@ function buildDockerArgs({
   return args;
 }
 
-function spawnWithTimeout(command, args, containerName, timeoutMs) {
+/**
+ * Spawns a docker command, writes stdinData to the container's stdin then
+ * closes the pipe (signaling EOF), collects stdout/stderr, and enforces a
+ * timeout via `docker kill`.
+ */
+function spawnWithTimeout(command, args, containerName, timeoutMs, stdinData) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args);
 
@@ -231,6 +225,13 @@ function spawnWithTimeout(command, args, containerName, timeoutMs) {
       timedOut = true;
       spawn('docker', ['kill', containerName]).on('error', () => {});
     }, timeoutMs);
+
+    // Write stdin data then close the pipe immediately.
+    // child.stdin.end() with data is equivalent to write() + end() — it sends
+    // the data and then EOF in one call. If stdinData is empty, this just
+    // sends EOF, which is the correct behaviour for programs that don't read
+    // from stdin (they see an immediately-closed pipe and carry on as normal).
+    child.stdin.end(stdinData);
 
     child.stdout.on('data', (chunk) => {
       if (stdout.length < MAX_OUTPUT_CHARS) stdout += chunk.toString();

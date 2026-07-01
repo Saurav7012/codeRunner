@@ -7,15 +7,13 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
-app.use(express.json({ limit: '1mb' })); // limit early - no huge payloads
+app.use(express.json({ limit: '1mb' }));
 
-// Languages we support - used for validation
 const SUPPORTED_LANGUAGES = ['python', 'c', 'cpp', 'java', 'javascript'];
 
 app.post('/api/run', async (req, res) => {
   const { language, code, stdin } = req.body;
 
-  // Basic validation
   if (!language || !code) {
     return res.status(400).json({
       error: 'Both "language" and "code" fields are required.',
@@ -28,13 +26,9 @@ app.post('/api/run', async (req, res) => {
     });
   }
 
-  // stdin is accepted but not yet wired into execution - that's Block 6.
-  // As of Block 4, all 5 languages have working Docker runners.
-  // runInDocker now returns a `phase` field ('compile' | 'run') for
-  // compiled languages, so the caller can distinguish a compile error
-  // from a runtime error. The frontend doesn't use this yet (Block 5).
   try {
-    const result = await runInDocker(language, code);
+    // Pass stdin through — defaults to '' in runInDocker if omitted.
+    const result = await runInDocker(language, code, stdin ?? '');
     return res.status(200).json(result);
   } catch (err) {
     console.error('Docker execution failed:', err);

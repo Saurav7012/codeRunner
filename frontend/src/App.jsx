@@ -1,12 +1,8 @@
 import { useState } from 'react';
 import Editor from '@monaco-editor/react';
-import { useEffect } from 'react';
 
 const LANGUAGES = ['python', 'c', 'cpp', 'java', 'javascript'];
 
-// Maps our language keys to Monaco's language ids (mostly identical;
-// called out explicitly so this is the one place to fix if Monaco's
-// ids ever diverge from ours).
 const MONACO_LANGUAGE = {
   python: 'python',
   c: 'c',
@@ -26,22 +22,17 @@ const DEFAULT_CODE = {
 function App() {
   const [language, setLanguage] = useState('python');
   const [code, setCode] = useState(DEFAULT_CODE.python);
+  const [stdin, setStdin] = useState('');
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-
   const handleLanguageChange = (newLang) => {
     setLanguage(newLang);
-    // Swap in starter code for the new language only if the user hasn't
-    // diverged from whatever the current language's default looked like —
-    // avoids silently wiping work, but still gives a useful starting point
-    // the first time someone picks a language.
-    setCode(DEFAULT_CODE[newLang]);
-    
+    if (Object.values(DEFAULT_CODE).includes(code)) {
+      setCode(DEFAULT_CODE[newLang]);
+    }
   };
-
-  
 
   const handleRun = async () => {
     setLoading(true);
@@ -52,7 +43,7 @@ function App() {
       const res = await fetch('/api/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ language, code }),
+        body: JSON.stringify({ language, code, stdin }),
       });
 
       const data = await res.json();
@@ -84,7 +75,6 @@ function App() {
           ))}
         </select>
 
-
         <div className="rounded-lg overflow-hidden border border-base-300">
           <Editor
             height="400px"
@@ -99,6 +89,20 @@ function App() {
               automaticLayout: true,
               tabSize: 4,
             }}
+          />
+        </div>
+
+        {/* Stdin input — always visible so users know it exists */}
+        <div className="space-y-1">
+          <label className="text-sm font-medium opacity-70">
+            stdin <span className="opacity-50">(optional — fed to your program's standard input)</span>
+          </label>
+          <textarea
+            className="textarea textarea-bordered w-full font-mono text-sm"
+            rows={3}
+            placeholder="Enter program input here..."
+            value={stdin}
+            onChange={(e) => setStdin(e.target.value)}
           />
         </div>
 
@@ -129,11 +133,6 @@ function App() {
   );
 }
 
-/**
- * Renders the backend's result object, branching on `phase`/`timedOut`/
- * `oomKilled` so a compile error, a timeout, an OOM kill, and a normal
- * run all look distinct rather than being squashed into one generic box.
- */
 function OutputPanel({ result }) {
   const { phase, stdout, stderr, exitCode, executionTime, compileTime, timedOut, oomKilled } = result;
 

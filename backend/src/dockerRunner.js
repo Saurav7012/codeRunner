@@ -107,10 +107,11 @@ async function runInterpreted(config, hostDir, containerFilePath, requestId, std
 
   const startTime = Date.now();
   const result = await spawnWithTimeout('docker', args, containerName, RUN_TIMEOUT_MS, stdin);
+
   return {
     phase: 'run',
     ...result,
-    executionTime: Date.now() - startTime,
+    executionTime: Date.now() - starctTime,
   };
 }
 

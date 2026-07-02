@@ -111,7 +111,7 @@ async function runInterpreted(config, hostDir, containerFilePath, requestId, std
   return {
     phase: 'run',
     ...result,
-    executionTime: Date.now() - starctTime,
+    executionTime: Date.now() - startTime,
   };
 }
 

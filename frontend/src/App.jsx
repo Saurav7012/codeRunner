@@ -25,7 +25,7 @@ const FILENAME = {
   python: 'main.py',
   c: 'main.c',
   cpp: 'main.cpp',
-  java: 'Main.java',
+  java: 'main.java',
   javascript: 'main.js',
 };
 
